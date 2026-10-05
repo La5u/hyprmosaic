@@ -1,10 +1,10 @@
 # hyprmosaic
 
-A Hyprland plugin that gives every workspace its own wallpaper, drawn as part of the workspace, so it slides along with it. It can also lay workspaces out as a grid (3x3 by default) that you swipe through in both directions.
+A Hyprland plugin that gives every workspace its own wallpaper, drawn as part of the workspace, so it slides along with it. It works with any workspace setup. Out of the box it also turns workspaces 1–9 into a 3x3 grid you swipe through in both directions.
 
 <!-- demo video -->
 
-Other wallpaper tools draw one background behind every workspace and swap it after a switch. hyprmosaic draws each wallpaper with its workspace, so mid-swipe you see half of each one. That works with its own grid swipes, Hyprland's built-in workspace swipe, and keyboard switching.
+Other wallpaper tools draw one background behind every workspace and swap it after a switch. hyprmosaic draws each wallpaper with its workspace, so mid-swipe you see half of each one. That works with hyprmosaic's grid swipes, Hyprland's built-in workspace swipe, and keyboard switching.
 
 ## Install
 
@@ -52,9 +52,11 @@ backend = none
 post_command = ln -sf $wallpaper ~/.local/state/hyprmosaic/$(hyprctl activeworkspace -j | jq .id)
 ```
 
-## Grid
+Waypaper won't start unless some wallpaper backend is installed, even with `backend = none`. Install a small one such as `swaybg`; it's never run.
 
-Workspaces `1` to `columns × rows` are laid out row by row. The default is 3x3:
+## Workspace layouts
+
+**3x3 grid (default).** Workspaces 1–9, swiped with three fingers. Each swipe moves one column or one row and stops at the edges:
 
 ```
 1 2 3
@@ -62,7 +64,19 @@ Workspaces `1` to `columns × rows` are laid out row by row. The default is 3x3:
 7 8 9
 ```
 
-Swiping moves one column or one row and stops at the edges. Set `rows = 1` for a single row of workspaces, or `fingers = 0` to turn hyprmosaic's swipes off and keep only the wallpapers (for example with Hyprland's own `workspace` gesture).
+**Any other grid.** Set `columns` and `rows`. Workspaces `1` to `columns × rows` are laid out row by row, for example 4x2:
+
+```lua
+hl.config({ plugin = { hyprmosaic = { columns = 4, rows = 2 } } })
+```
+
+**A single row.** Set `rows = 1` and swipe left and right through workspaces `1` to `columns`.
+
+**Your own setup.** Set `fingers = 0` to turn hyprmosaic's swipes off and keep only the wallpapers. Switch workspaces however you already do: keybinds, Hyprland's own `workspace` gesture, Waybar or anything else. Any workspace number can have a wallpaper.
+
+```lua
+hl.config({ plugin = { hyprmosaic = { fingers = 0 } } })
+```
 
 ## Options
 
@@ -73,13 +87,14 @@ Swiping moves one column or one row and stops at the edges. Set `rows = 1` for a
 | `fingers` | `3` | fingers for grid swipes, `0` to disable them |
 | `blur_fill` | `true` | fill around an image with a blurred copy of it, instead of `misc:background_color` |
 
+Set them in `hyprland.lua`, or as `plugin:hyprmosaic:<option>` in `hyprland.conf`:
+
 ```lua
-hl.config({ plugin = { hyprmosaic = { columns = 4, rows = 2, fingers = 4, blur_fill = false } } })
+hl.config({ plugin = { hyprmosaic = { blur_fill = false } } })
 ```
 
 ```ini
-plugin:hyprmosaic:columns = 4
-plugin:hyprmosaic:rows = 2
+plugin:hyprmosaic:blur_fill = false
 ```
 
 Images are fitted whole. Swipes follow Hyprland's `gestures:workspace_swipe_distance`, `workspace_swipe_invert`, `workspace_swipe_cancel_ratio` and `workspace_swipe_min_speed_to_force`.

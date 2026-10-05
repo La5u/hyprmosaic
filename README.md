@@ -2,7 +2,7 @@
 
 A Hyprland plugin that gives every workspace its own wallpaper, drawn as part of the workspace, so it slides along with it. It works with any workspace setup. Out of the box it also turns workspaces 1–9 into a 3x3 grid you swipe through in both directions.
 
-<!-- demo video -->
+![hyprmosaic: per-workspace Arcane wallpapers sliding with a 3x3 grid swipe](assets/demo.webp)
 
 Other wallpaper tools draw one background behind every workspace and swap it after a switch. hyprmosaic draws each wallpaper with its workspace, so mid-swipe you see half of each one. That works with hyprmosaic's grid swipes, Hyprland's built-in workspace swipe, and keyboard switching.
 

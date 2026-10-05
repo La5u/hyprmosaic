@@ -29,12 +29,16 @@
 #include <hyprland/src/render/pass/RectPassElement.hpp>
 #include <hyprland/src/render/pass/TexPassElement.hpp>
 #include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/Compositor.hpp>
 
+// Everything but the plugin entry points has internal linkage, so a reloaded copy never calls into an old one.
+namespace {
+
 static HANDLE PHANDLE = nullptr;
-static Hyprutils::Signal::CHyprSignalListener beginListener, updateListener, endListener, renderListener;
+static Hyprutils::Signal::CHyprSignalListener beginListener, updateListener, endListener, renderListener, tickListener;
 static SP<Config::Values::CBoolValue> blurFill;
 static SP<Config::Values::CIntValue> columnsCfg, rowsCfg, fingersCfg;
 
@@ -54,7 +58,11 @@ struct GridSwipe {
     double averageSpeed = 0;
     int speedPoints = 0;
     PHLWORKSPACE start;
-    PHLWORKSPACE held; // workspaces are weakly tracked, so keep a newly created target alive during the swipe
+    // Hyprland only keeps a workspace alive while it is shown or has windows. Hold empty ones ourselves
+    // during the swipe, and afterwards until their release animation ends, or they vanish mid-animation.
+    PHLWORKSPACE held;
+    std::vector<PHLWORKSPACE> settling;
+    UP<SEventLoopDoLaterLock> releaseLater;
     PHLMONITORREF monitor;
 
     // Workspaces 1..columns*rows, laid out row by row.
@@ -186,17 +194,21 @@ struct GridSwipe {
             if (positive && positive != start) *positive->m_renderOffset = offset(axisDistance());
             *start->m_renderOffset = Vector2D{};
         } else {
+            // changeWorkspace() restarts both workspaces' animations, so continue them from where the swipe left them.
             auto target = ensure(targetID);
-            const auto oldTargetOffset = target->m_renderOffset->value();
+            const auto targetOffset = target->m_renderOffset->value();
+            const auto startOffset = start->m_renderOffset->value();
             monitor->changeWorkspace(targetID);
-            target->m_renderOffset->setValue(oldTargetOffset);
+            target->m_renderOffset->setValue(targetOffset);
             target->m_alpha->setValueAndWarp(1.F);
-            start->m_renderOffset->setValue(start->m_renderOffset->value());
+            start->m_renderOffset->setValue(startOffset);
             *start->m_renderOffset = offset(delta < 0 ? axisDistance() : -axisDistance());
             start->m_alpha->setValueAndWarp(1.F);
             g_pInputManager->unconstrainMouse();
         }
 
+        for (const auto& ws : {start, held, negative, positive})
+            if (ws && std::ranges::find(settling, ws) == settling.end()) settling.push_back(ws);
         if (negative) negative->m_forceRendering = false;
         if (positive) positive->m_forceRendering = false;
         start->m_forceRendering = false;
@@ -205,6 +217,17 @@ struct GridSwipe {
         start = nullptr;
         held = nullptr;
         active = false;
+    }
+
+    // Called every frame: once the settling workspaces stop animating, let them go (outside rendering).
+    void releaseSettled() {
+        if (settling.empty() || releaseLater) return;
+        if (std::ranges::any_of(settling, [](const auto& ws) { return ws->m_renderOffset->isBeingAnimated() || ws->m_alpha->isBeingAnimated(); }))
+            return;
+        releaseLater = g_pEventLoopManager->doLaterLock([this] {
+            settling.clear();
+            releaseLater.reset();
+        });
     }
 } swipe;
 
@@ -292,6 +315,7 @@ struct GridWallpapers {
     }
 
     void render() {
+        swipe.releaseSettled();
         for (const int id : dirty) load(id);
         dirty.clear();
         if (walls.empty()) return;
@@ -320,6 +344,16 @@ struct GridWallpapers {
         }
     }
 
+    // Hyprland only redraws a workspace's windows while it animates, never the background, so
+    // redraw monitors where a workspace with a wallpaper is moving. Runs on every animation tick.
+    void damageAnimating() {
+        for (const auto& ref : State::workspaceState()->workspaceRefs()) {
+            const auto ws = ref.lock();
+            if (!ws || !walls.contains(ws->m_id) || (!ws->m_renderOffset->isBeingAnimated() && !ws->m_alpha->isBeingAnimated())) continue;
+            if (const auto monitor = ws->m_monitor.lock()) g_pHyprRenderer->damageMonitor(monitor);
+        }
+    }
+
     // Scale tex to fit (or cover) the box at origin/size, centered and clipped to it.
     static void drawImage(const SP<Render::ITexture>& tex, const Vector2D& origin, const Vector2D& size, float alpha, bool cover) {
         const double scale = cover ? std::max(size.x / tex->m_size.x, size.y / tex->m_size.y) : std::min(size.x / tex->m_size.x, size.y / tex->m_size.y);
@@ -331,6 +365,8 @@ struct GridWallpapers {
         g_pHyprRenderer->addPassElement(makeUnique<CTexPassElement>(std::move(data)));
     }
 } wallpapers;
+
+} // namespace
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() { return HYPRLAND_API_VERSION; }
 
@@ -360,6 +396,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
         if (stage == RENDER_POST_WALLPAPER) wallpapers.render();
     });
+    tickListener = Event::bus()->m_events.tick.listen([] { wallpapers.damageAnimating(); });
     wallpapers.init();
     return {"hyprmosaic", "Per-workspace wallpapers that slide with their workspace, plus grid workspace swipes", "La5u", "1.0"};
 }
@@ -369,7 +406,12 @@ APICALL EXPORT void PLUGIN_EXIT() {
     updateListener.reset();
     endListener.reset();
     renderListener.reset();
+    tickListener.reset();
     wallpapers.exit();
+    swipe.releaseLater.reset();
+    swipe.settling.clear();
+    swipe.held.reset();
+    swipe.start.reset();
     blurFill.reset();
     columnsCfg.reset();
     rowsCfg.reset();

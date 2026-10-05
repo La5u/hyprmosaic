@@ -1,0 +1,10 @@
+[repository]
+name = "hyprmosaic"
+authors = ["La5u"]
+commit_pins = []
+
+[hyprmosaic]
+description = "3x3 workspace grid swipes with per-workspace wallpapers"
+authors = ["La5u"]
+output = "hyprmosaic.so"
+build = ["make all"]

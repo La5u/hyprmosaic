@@ -70,6 +70,12 @@ Waypaper won't start unless some wallpaper backend is installed, even with `back
 hl.config({ plugin = { hyprmosaic = { columns = 4, rows = 2 } } })
 ```
 
+**Wrap around.** Set `wrap = true` and swipes past an edge carry on from the opposite edge instead of stopping: left from 1 goes to 3, up from 2 goes to 8.
+
+```lua
+hl.config({ plugin = { hyprmosaic = { wrap = true } } })
+```
+
 **A single row.** Set `rows = 1` and swipe left and right through workspaces `1` to `columns`.
 
 **Your own setup.** Set `fingers = 0` to turn hyprmosaic's swipes off and keep only the wallpapers. Switch workspaces however you already do: keybinds, Hyprland's own `workspace` gesture, Waybar or anything else. Any workspace number can have a wallpaper.
@@ -85,6 +91,7 @@ hl.config({ plugin = { hyprmosaic = { fingers = 0 } } })
 | `columns` | `3` | grid columns, 1–10 |
 | `rows` | `3` | grid rows, 1–10 |
 | `fingers` | `3` | fingers for grid swipes, `0` to disable them |
+| `wrap` | `false` | swiping past a grid edge wraps to the opposite edge, e.g. left from 1 goes to 3 |
 | `special_swipe` | `false` | a grid swipe slides an open special workspace out with the workspace and closes it |
 | `blur_fill` | `true` | fill around an image with a blurred copy of it, instead of `misc:background_color` |
 

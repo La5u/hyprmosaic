@@ -39,12 +39,13 @@ namespace {
 
 static HANDLE PHANDLE = nullptr;
 static Hyprutils::Signal::CHyprSignalListener beginListener, updateListener, endListener, renderListener, tickListener;
-static SP<Config::Values::CBoolValue> blurFill, specialSwipeCfg;
+static SP<Config::Values::CBoolValue> blurFill, wrapCfg, specialSwipeCfg;
 static SP<Config::Values::CIntValue> columnsCfg, rowsCfg, fingersCfg;
 
 // Config values, with defaults in case registration failed.
 static bool cfgBlurFill() { return !blurFill || blurFill->value(); }
 static bool cfgSpecialSwipe() { return specialSwipeCfg && specialSwipeCfg->value(); }
+static bool cfgWrap() { return wrapCfg && wrapCfg->value(); }
 static int cfgColumns() { return columnsCfg ? std::clamp<int>(columnsCfg->value(), 1, 10) : 3; }
 static int cfgRows() { return rowsCfg ? std::clamp<int>(rowsCfg->value(), 1, 10) : 3; }
 static int cfgFingers() { return fingersCfg ? fingersCfg->value() : 3; }
@@ -54,6 +55,7 @@ struct GridSwipe {
     bool active = false;
     bool vertical = false;
     int columns = 3, rows = 3; // grid size, fixed for the duration of a swipe
+    bool wrap = false;          // swiping past an edge lands on the opposite one
     Vector2D total{};
     double delta = 0;
     double averageSpeed = 0;
@@ -71,16 +73,16 @@ struct GridSwipe {
 
     // Workspaces 1..columns*rows, laid out row by row.
     bool valid(int id) const { return id >= 1 && id <= columns * rows; }
-    int negativeID() const {
-        const int id = start->m_id;
-        if (vertical) return id > columns ? id - columns : id;
-        return (id - 1) % columns > 0 ? id - 1 : id;
+    // Neighbour `step` (-1 or 1) along the swipe axis; the start itself at an edge unless wrapping.
+    int neighbourID(int step) const {
+        const int id = start->m_id - 1, col = id % columns, row = id / columns;
+        const int size = vertical ? rows : columns, pos = vertical ? row : col;
+        int next = pos + step;
+        if (next < 0 || next >= size) next = wrap ? (next + size) % size : pos;
+        return (vertical ? next * columns + col : row * columns + next) + 1;
     }
-    int positiveID() const {
-        const int id = start->m_id;
-        if (vertical) return id <= columns * (rows - 1) ? id + columns : id;
-        return (id - 1) % columns < columns - 1 ? id + 1 : id;
-    }
+    int negativeID() const { return neighbourID(-1); }
+    int positiveID() const { return neighbourID(1); }
     PHLWORKSPACE get(int id) const {
         return valid(id) ? State::workspaceState()->query().id(id).run() : nullptr;
     }
@@ -119,6 +121,7 @@ struct GridSwipe {
         tracking = true;
         columns = cfgColumns();
         rows = cfgRows();
+        wrap = cfgWrap();
         active = false;
         total = {};
         delta = 0;
@@ -415,6 +418,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, rowsCfg)) rowsCfg.reset();
     fingersCfg = makeShared<Config::Values::CIntValue>("plugin:hyprmosaic:fingers", "Fingers for grid swipes; 0 disables them (wallpapers only)", 3, Config::Values::SIntValueOptions{.min = 0, .max = 5});
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, fingersCfg)) fingersCfg.reset();
+    wrapCfg = makeShared<Config::Values::CBoolValue>("plugin:hyprmosaic:wrap", "Swiping past a grid edge wraps around to the opposite edge", false);
+    if (!HyprlandAPI::addConfigValueV2(PHANDLE, wrapCfg)) wrapCfg.reset();
     specialSwipeCfg = makeShared<Config::Values::CBoolValue>("plugin:hyprmosaic:special_swipe", "Grid swipes slide an open special workspace out and close it", false);
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, specialSwipeCfg)) specialSwipeCfg.reset();
 
@@ -451,6 +456,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     swipe.start.reset();
     swipe.special.reset();
     blurFill.reset();
+    wrapCfg.reset();
     specialSwipeCfg.reset();
     columnsCfg.reset();
     rowsCfg.reset();

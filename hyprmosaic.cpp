@@ -39,11 +39,12 @@ namespace {
 
 static HANDLE PHANDLE = nullptr;
 static Hyprutils::Signal::CHyprSignalListener beginListener, updateListener, endListener, renderListener, tickListener;
-static SP<Config::Values::CBoolValue> blurFill;
+static SP<Config::Values::CBoolValue> blurFill, specialSwipeCfg;
 static SP<Config::Values::CIntValue> columnsCfg, rowsCfg, fingersCfg;
 
 // Config values, with defaults in case registration failed.
 static bool cfgBlurFill() { return !blurFill || blurFill->value(); }
+static bool cfgSpecialSwipe() { return specialSwipeCfg && specialSwipeCfg->value(); }
 static int cfgColumns() { return columnsCfg ? std::clamp<int>(columnsCfg->value(), 1, 10) : 3; }
 static int cfgRows() { return rowsCfg ? std::clamp<int>(rowsCfg->value(), 1, 10) : 3; }
 static int cfgFingers() { return fingersCfg ? fingersCfg->value() : 3; }
@@ -61,6 +62,9 @@ struct GridSwipe {
     // Hyprland only keeps a workspace alive while it is shown or has windows. Hold empty ones ourselves
     // during the swipe, and afterwards until their release animation ends, or they vanish mid-animation.
     PHLWORKSPACE held;
+    // With special_swipe, a special workspace open over the start slides out with it, and closes if the swipe commits.
+    PHLWORKSPACE special;
+    float specialFade = 0, specialDim = 0, specialBlur = 0;
     std::vector<PHLWORKSPACE> settling;
     UP<SEventLoopDoLaterLock> releaseLater;
     PHLMONITORREF monitor;
@@ -92,6 +96,16 @@ struct GridSwipe {
         return vertical ? Vector2D{0.0, value} : Vector2D{value, 0.0};
     }
 
+    // Move the special workspace to `at`, fading its dim/blur by how far the swipe has gone (0..1).
+    void slideSpecial(Vector2D at, double progress) {
+        if (!special) return;
+        const float keep = 1.F - (float)std::clamp(progress, 0.0, 1.0);
+        special->m_renderOffset->setValueAndWarp(at);
+        monitor->m_specialFade->setValueAndWarp(specialFade * keep);
+        monitor->m_specialDim->setValueAndWarp(specialDim * keep);
+        monitor->m_specialBlur->setValueAndWarp(specialBlur * keep);
+    }
+
     // A target is reachable if it isn't the start and doesn't live on another monitor.
     bool reachable(int id) const {
         if (id == start->m_id) return false;
@@ -112,6 +126,12 @@ struct GridSwipe {
         speedPoints = 0;
         start = focused->m_activeWorkspace;
         monitor = focused;
+        special = cfgSpecialSwipe() ? focused->m_activeSpecialWorkspace : nullptr;
+        if (special) {
+            specialFade = focused->m_specialFade->value();
+            specialDim = focused->m_specialDim->value();
+            specialBlur = focused->m_specialBlur->value();
+        }
     }
 
     void update(const IPointer::SSwipeUpdateEvent& e) {
@@ -145,6 +165,7 @@ struct GridSwipe {
             held = nullptr;
             delta = 0;
             start->m_renderOffset->setValueAndWarp({});
+            slideSpecial({}, 0);
             g_pHyprRenderer->damageMonitor(monitor.lock());
             return;
         }
@@ -165,6 +186,7 @@ struct GridSwipe {
         const double targetOffset = currentOffset + (delta < 0 ? -screen : screen);
         start->m_renderOffset->setValueAndWarp(offset(currentOffset));
         target->m_renderOffset->setValueAndWarp(offset(targetOffset));
+        slideSpecial(offset(currentOffset), std::abs(delta) / distance);
         start->updateWindowDecos();
         target->updateWindowDecos();
         g_pHyprRenderer->damageMonitor(monitor.lock());
@@ -175,6 +197,7 @@ struct GridSwipe {
         tracking = false;
         if (!active || !start || !monitor) {
             held = nullptr;
+            special = nullptr;
             active = false;
             return;
         }
@@ -193,11 +216,22 @@ struct GridSwipe {
             if (negative && negative != start) *negative->m_renderOffset = offset(-axisDistance());
             if (positive && positive != start) *positive->m_renderOffset = offset(axisDistance());
             *start->m_renderOffset = Vector2D{};
+            if (special) {
+                *special->m_renderOffset = Vector2D{};
+                *monitor->m_specialFade = specialFade;
+                *monitor->m_specialDim = specialDim;
+                *monitor->m_specialBlur = specialBlur;
+            }
         } else {
             // changeWorkspace() restarts both workspaces' animations, so continue them from where the swipe left them.
             auto target = ensure(targetID);
             const auto targetOffset = target->m_renderOffset->value();
             const auto startOffset = start->m_renderOffset->value();
+            if (special && monitor->m_activeSpecialWorkspace == special) {
+                monitor->setSpecialWorkspace(nullptr);
+                // Hidden now; put it back in place for the next time it opens.
+                special->m_renderOffset->setValueAndWarp({});
+            }
             monitor->changeWorkspace(targetID);
             target->m_renderOffset->setValue(targetOffset);
             target->m_alpha->setValueAndWarp(1.F);
@@ -216,6 +250,7 @@ struct GridSwipe {
         g_pInputManager->refocus();
         start = nullptr;
         held = nullptr;
+        special = nullptr;
         active = false;
     }
 
@@ -380,6 +415,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, rowsCfg)) rowsCfg.reset();
     fingersCfg = makeShared<Config::Values::CIntValue>("plugin:hyprmosaic:fingers", "Fingers for grid swipes; 0 disables them (wallpapers only)", 3, Config::Values::SIntValueOptions{.min = 0, .max = 5});
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, fingersCfg)) fingersCfg.reset();
+    specialSwipeCfg = makeShared<Config::Values::CBoolValue>("plugin:hyprmosaic:special_swipe", "Grid swipes slide an open special workspace out and close it", false);
+    if (!HyprlandAPI::addConfigValueV2(PHANDLE, specialSwipeCfg)) specialSwipeCfg.reset();
 
     beginListener = Event::bus()->m_events.gesture.swipe.begin.listen(
         [](IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& info) {
@@ -412,7 +449,9 @@ APICALL EXPORT void PLUGIN_EXIT() {
     swipe.settling.clear();
     swipe.held.reset();
     swipe.start.reset();
+    swipe.special.reset();
     blurFill.reset();
+    specialSwipeCfg.reset();
     columnsCfg.reset();
     rowsCfg.reset();
     fingersCfg.reset();

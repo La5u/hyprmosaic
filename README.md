@@ -85,6 +85,7 @@ hl.config({ plugin = { hyprmosaic = { fingers = 0 } } })
 | `columns` | `3` | grid columns, 1–10 |
 | `rows` | `3` | grid rows, 1–10 |
 | `fingers` | `3` | fingers for grid swipes, `0` to disable them |
+| `special_swipe` | `false` | a grid swipe slides an open special workspace out with the workspace and closes it |
 | `blur_fill` | `true` | fill around an image with a blurred copy of it, instead of `misc:background_color` |
 
 Set them in `hyprland.lua`, or as `plugin:hyprmosaic:<option>` in `hyprland.conf`:

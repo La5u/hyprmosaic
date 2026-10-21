@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <sys/inotify.h>
 #include <unistd.h>
+#include <libinput.h>
 
 #include <hyprgraphics/image/Image.hpp>
 
@@ -38,32 +39,49 @@
 namespace {
 
 static HANDLE PHANDLE = nullptr;
-static Hyprutils::Signal::CHyprSignalListener beginListener, updateListener, endListener, renderListener, tickListener;
-static SP<Config::Values::CBoolValue> blurFill, wrapCfg, specialSwipeCfg;
+static Hyprutils::Signal::CHyprSignalListener beginListener, updateListener, endListener, renderListener, tickListener, reloadListener;
+static SP<Config::Values::CBoolValue> blurFill, wrapCfg, specialSwipeCfg, freeSwipeCfg, quietLibinputCfg;
 static SP<Config::Values::CIntValue> columnsCfg, rowsCfg, fingersCfg;
 
 // Config values, with defaults in case registration failed.
 static bool cfgBlurFill() { return !blurFill || blurFill->value(); }
 static bool cfgSpecialSwipe() { return specialSwipeCfg && specialSwipeCfg->value(); }
+static bool cfgFreeSwipe() { return freeSwipeCfg && freeSwipeCfg->value(); }
+static bool cfgQuietLibinput() { return quietLibinputCfg && quietLibinputCfg->value(); }
 static bool cfgWrap() { return wrapCfg && wrapCfg->value(); }
 static int cfgColumns() { return columnsCfg ? std::clamp<int>(columnsCfg->value(), 1, 10) : 3; }
 static int cfgRows() { return rowsCfg ? std::clamp<int>(rowsCfg->value(), 1, 10) : 3; }
 static int cfgFingers() { return fingersCfg ? fingersCfg->value() : 3; }
 
+// Aquamarine asks libinput for debug messages and logs them all, whatever debug:disable_logs says.
+// With quiet_libinput, lower that to errors; otherwise (and on unload) put back aquamarine's level.
+static void applyLibinputLogLevel(bool quiet) {
+    const auto& session = g_pCompositor->m_aqBackend ? g_pCompositor->m_aqBackend->session : nullptr;
+    if (!session || !session->libinputHandle) return;
+    libinput_log_set_priority(session->libinputHandle, quiet ? LIBINPUT_LOG_PRIORITY_ERROR : LIBINPUT_LOG_PRIORITY_DEBUG);
+}
+
 struct GridSwipe {
+    // A workspace drawn next to the start during a swipe, `x`/`y` cells away (each -1..1).
+    struct Neighbour {
+        int x = 0, y = 0;
+        PHLWORKSPACE ws;
+    };
+
     bool tracking = false;
     bool active = false;
-    bool vertical = false;
+    bool freeAxes = false;  // both axes at once, reaching diagonal neighbours
+    bool vertical = false;  // the locked axis when not free
     int columns = 3, rows = 3; // grid size, fixed for the duration of a swipe
     bool wrap = false;          // swiping past an edge lands on the opposite one
     Vector2D total{};
-    double delta = 0;
-    double averageSpeed = 0;
+    Vector2D delta{};
+    Vector2D averageSpeed{};
     int speedPoints = 0;
     PHLWORKSPACE start;
-    // Hyprland only keeps a workspace alive while it is shown or has windows. Hold empty ones ourselves
-    // during the swipe, and afterwards until their release animation ends, or they vanish mid-animation.
-    PHLWORKSPACE held;
+    // Hyprland only keeps a workspace alive while it is shown or has windows. Hold the neighbours ourselves
+    // during the swipe, and afterwards until their release animation ends, or empty ones vanish mid-animation.
+    std::vector<Neighbour> shown;
     // With special_swipe, a special workspace open over the start slides out with it, and closes if the swipe commits.
     PHLWORKSPACE special;
     float specialFade = 0, specialDim = 0, specialBlur = 0;
@@ -71,18 +89,24 @@ struct GridSwipe {
     UP<SEventLoopDoLaterLock> releaseLater;
     PHLMONITORREF monitor;
 
+    static int sign(double v) { return (v > 0) - (v < 0); }
+
     // Workspaces 1..columns*rows, laid out row by row.
     bool valid(int id) const { return id >= 1 && id <= columns * rows; }
-    // Neighbour `step` (-1 or 1) along the swipe axis; the start itself at an edge unless wrapping.
-    int neighbourID(int step) const {
-        const int id = start->m_id - 1, col = id % columns, row = id / columns;
-        const int size = vertical ? rows : columns, pos = vertical ? row : col;
-        int next = pos + step;
-        if (next < 0 || next >= size) next = wrap ? (next + size) % size : pos;
-        return (vertical ? next * columns + col : row * columns + next) + 1;
+    // Workspace `x` columns and `y` rows from the start, or 0 past an edge unless wrapping.
+    int cellID(int x, int y) const {
+        const int id = start->m_id - 1;
+        int col = id % columns + x, row = id / columns + y;
+        if (col < 0 || col >= columns) {
+            if (!wrap) return 0;
+            col = (col + columns) % columns;
+        }
+        if (row < 0 || row >= rows) {
+            if (!wrap) return 0;
+            row = (row + rows) % rows;
+        }
+        return row * columns + col + 1;
     }
-    int negativeID() const { return neighbourID(-1); }
-    int positiveID() const { return neighbourID(1); }
     PHLWORKSPACE get(int id) const {
         return valid(id) ? State::workspaceState()->query().id(id).run() : nullptr;
     }
@@ -90,12 +114,13 @@ struct GridSwipe {
         if (auto ws = get(id)) return ws;
         return State::workspaceState()->create(id, monitor->m_id);
     }
-    double axisDistance() const {
+    // One cell's step on screen, per axis.
+    Vector2D cellSize() const {
         static auto gap = CConfigValue<Config::INTEGER>("general:gaps_workspaces");
-        return vertical ? monitor->m_size.y + *gap : monitor->m_size.x + *gap;
+        return monitor->m_size + Vector2D{(double)*gap, (double)*gap};
     }
-    Vector2D offset(double value) const {
-        return vertical ? Vector2D{0.0, value} : Vector2D{value, 0.0};
+    Vector2D cellOffset(int x, int y) const {
+        return cellSize() * Vector2D{(double)x, (double)y};
     }
 
     // Move the special workspace to `at`, fading its dim/blur by how far the swipe has gone (0..1).
@@ -108,9 +133,9 @@ struct GridSwipe {
         monitor->m_specialBlur->setValueAndWarp(specialBlur * keep);
     }
 
-    // A target is reachable if it isn't the start and doesn't live on another monitor.
+    // A target is reachable if it exists in the grid, isn't the start and doesn't live on another monitor.
     bool reachable(int id) const {
-        if (id == start->m_id) return false;
+        if (!valid(id) || id == start->m_id) return false;
         const auto ws = get(id);
         return !ws || ws->m_monitor == monitor;
     }
@@ -122,11 +147,13 @@ struct GridSwipe {
         columns = cfgColumns();
         rows = cfgRows();
         wrap = cfgWrap();
+        freeAxes = cfgFreeSwipe();
         active = false;
         total = {};
-        delta = 0;
-        averageSpeed = 0;
+        delta = {};
+        averageSpeed = {};
         speedPoints = 0;
+        shown.clear();
         start = focused->m_activeWorkspace;
         monitor = focused;
         special = cfgSpecialSwipe() ? focused->m_activeSpecialWorkspace : nullptr;
@@ -141,7 +168,7 @@ struct GridSwipe {
         if (!tracking || !start || !monitor) return;
         total += e.delta;
 
-        // Lock to the dominant physical axis once enough motion is available.
+        // Lock to the dominant physical axis once enough motion is available, unless swiping freely.
         if (!active) {
             if (std::abs(total.x) < 5 && std::abs(total.y) < 5) return;
             vertical = std::abs(total.y) > std::abs(total.x);
@@ -152,46 +179,51 @@ struct GridSwipe {
         static auto distanceCfg = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_distance");
         static auto invert = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_invert");
         const double distance = std::max<int64_t>(1, *distanceCfg);
-        const double movement = vertical ? e.delta.y : e.delta.x;
-        const double old = delta;
-        delta += *invert ? -movement : movement;
-        delta = std::clamp(delta, -distance, distance);
+        Vector2D movement = *invert ? -e.delta : e.delta;
+        if (!freeAxes) movement = vertical ? Vector2D{0.0, movement.y} : Vector2D{movement.x, 0.0};
+        const Vector2D old = delta;
+        delta += movement;
+        delta = {std::clamp(delta.x, -distance, distance), std::clamp(delta.y, -distance, distance)};
         ++speedPoints;
-        averageSpeed = (averageSpeed * (speedPoints - 1) + std::abs(delta - old)) / speedPoints;
+        const Vector2D moved = delta - old;
+        averageSpeed = (averageSpeed * (speedPoints - 1) + Vector2D{std::abs(moved.x), std::abs(moved.y)}) / speedPoints;
 
-        const int targetID = delta < 0 ? negativeID() : positiveID();
-        if (!reachable(targetID)) {
-            if (held && held != start) {
-                held->m_forceRendering = false;
-                held->m_alpha->setValueAndWarp(0.F);
+        // Drop an axis whose neighbour can't be reached; for a diagonal on another monitor, keep the stronger axis.
+        int x = sign(delta.x), y = sign(delta.y);
+        if (x && !reachable(cellID(x, 0))) delta.x = x = 0;
+        if (y && !reachable(cellID(0, y))) delta.y = y = 0;
+        if (x && y && !reachable(cellID(x, y))) {
+            if (std::abs(delta.x) >= std::abs(delta.y)) delta.y = y = 0;
+            else delta.x = x = 0;
+        }
+
+        std::vector<Neighbour> next;
+        if (x) next.push_back({x, 0, ensure(cellID(x, 0))});
+        if (y) next.push_back({0, y, ensure(cellID(0, y))});
+        if (x && y) next.push_back({x, y, ensure(cellID(x, y))});
+
+        // Hide every other neighbour on this monitor: ones the swipe moved away from, and ones still sliding out
+        // from an earlier switch.
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                const auto ws = get(cellID(dx, dy));
+                if (!ws || ws == start || ws->m_monitor != monitor || std::ranges::any_of(next, [&](const auto& m) { return m.ws == ws; })) continue;
+                ws->m_forceRendering = false;
+                ws->m_alpha->setValueAndWarp(0.F);
             }
-            held = nullptr;
-            delta = 0;
-            start->m_renderOffset->setValueAndWarp({});
-            slideSpecial({}, 0);
-            g_pHyprRenderer->damageMonitor(monitor.lock());
-            return;
-        }
+        shown = std::move(next);
 
-        auto target = held = ensure(targetID);
-        const int oppositeID = delta < 0 ? positiveID() : negativeID();
-        auto opposite = get(oppositeID);
-        if (opposite && opposite != start && opposite != target) {
-            opposite->m_forceRendering = false;
-            opposite->m_alpha->setValueAndWarp(0.F);
-        }
-
-        start->m_forceRendering = true;
-        target->m_forceRendering = true;
-        target->m_alpha->setValueAndWarp(1.F);
-        const double screen = axisDistance();
-        const double currentOffset = (-delta / distance) * screen;
-        const double targetOffset = currentOffset + (delta < 0 ? -screen : screen);
-        start->m_renderOffset->setValueAndWarp(offset(currentOffset));
-        target->m_renderOffset->setValueAndWarp(offset(targetOffset));
-        slideSpecial(offset(currentOffset), std::abs(delta) / distance);
+        const Vector2D base = -(delta / distance) * cellSize();
+        start->m_forceRendering = !shown.empty();
+        start->m_renderOffset->setValueAndWarp(base);
         start->updateWindowDecos();
-        target->updateWindowDecos();
+        for (const auto& n : shown) {
+            n.ws->m_forceRendering = true;
+            n.ws->m_alpha->setValueAndWarp(1.F);
+            n.ws->m_renderOffset->setValueAndWarp(base + cellOffset(n.x, n.y));
+            n.ws->updateWindowDecos();
+        }
+        slideSpecial(base, std::max(std::abs(delta.x), std::abs(delta.y)) / distance);
         g_pHyprRenderer->damageMonitor(monitor.lock());
     }
 
@@ -199,7 +231,7 @@ struct GridSwipe {
         if (!tracking) return;
         tracking = false;
         if (!active || !start || !monitor) {
-            held = nullptr;
+            shown.clear();
             special = nullptr;
             active = false;
             return;
@@ -209,15 +241,17 @@ struct GridSwipe {
         static auto distanceCfg = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_distance");
         static auto force = CConfigValue<Config::INTEGER>("gestures:workspace_swipe_min_speed_to_force");
         const double distance = std::max<int64_t>(1, *distanceCfg);
-        const int targetID = delta < 0 ? negativeID() : positiveID();
-        auto negative = get(negativeID());
-        auto positive = get(positiveID());
-        const bool cancel = cancelled || !reachable(targetID) || std::abs(delta) < 2 ||
-            (std::abs(delta) < distance * *ratio && (*force == 0 || averageSpeed < *force));
+        // Each axis commits on its own, so a free swipe lands on whichever cell it went far or fast enough towards.
+        const auto commits = [&](double d, double speed) {
+            return std::abs(d) >= 2 && (std::abs(d) >= distance * *ratio || (*force != 0 && speed >= *force));
+        };
+        const int x = commits(delta.x, averageSpeed.x) ? sign(delta.x) : 0;
+        const int y = commits(delta.y, averageSpeed.y) ? sign(delta.y) : 0;
+        const int targetID = cellID(x, y);
+        const bool cancel = cancelled || !reachable(targetID);
 
         if (cancel) {
-            if (negative && negative != start) *negative->m_renderOffset = offset(-axisDistance());
-            if (positive && positive != start) *positive->m_renderOffset = offset(axisDistance());
+            for (const auto& n : shown) *n.ws->m_renderOffset = cellOffset(n.x, n.y);
             *start->m_renderOffset = Vector2D{};
             if (special) {
                 *special->m_renderOffset = Vector2D{};
@@ -239,20 +273,24 @@ struct GridSwipe {
             target->m_renderOffset->setValue(targetOffset);
             target->m_alpha->setValueAndWarp(1.F);
             start->m_renderOffset->setValue(startOffset);
-            *start->m_renderOffset = offset(delta < 0 ? axisDistance() : -axisDistance());
+            *start->m_renderOffset = cellOffset(-x, -y);
             start->m_alpha->setValueAndWarp(1.F);
+            // The other neighbours slide on to their place relative to the target.
+            for (const auto& n : shown)
+                if (n.ws != target) *n.ws->m_renderOffset = cellOffset(n.x - x, n.y - y);
             g_pInputManager->unconstrainMouse();
         }
 
-        for (const auto& ws : {start, held, negative, positive})
-            if (ws && std::ranges::find(settling, ws) == settling.end()) settling.push_back(ws);
-        if (negative) negative->m_forceRendering = false;
-        if (positive) positive->m_forceRendering = false;
+        if (std::ranges::find(settling, start) == settling.end()) settling.push_back(start);
+        for (const auto& n : shown) {
+            n.ws->m_forceRendering = false;
+            if (std::ranges::find(settling, n.ws) == settling.end()) settling.push_back(n.ws);
+        }
         start->m_forceRendering = false;
         g_pHyprRenderer->damageMonitor(monitor.lock());
         g_pInputManager->refocus();
         start = nullptr;
-        held = nullptr;
+        shown.clear();
         special = nullptr;
         active = false;
     }
@@ -422,6 +460,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, wrapCfg)) wrapCfg.reset();
     specialSwipeCfg = makeShared<Config::Values::CBoolValue>("plugin:hyprmosaic:special_swipe", "Grid swipes slide an open special workspace out and close it", false);
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, specialSwipeCfg)) specialSwipeCfg.reset();
+    freeSwipeCfg = makeShared<Config::Values::CBoolValue>("plugin:hyprmosaic:free_swipe", "Grid swipes move along both axes at once, reaching diagonal workspaces", false);
+    if (!HyprlandAPI::addConfigValueV2(PHANDLE, freeSwipeCfg)) freeSwipeCfg.reset();
+    quietLibinputCfg = makeShared<Config::Values::CBoolValue>("plugin:hyprmosaic:quiet_libinput", "Only log libinput errors, not its per-event debug messages", false);
+    if (!HyprlandAPI::addConfigValueV2(PHANDLE, quietLibinputCfg)) quietLibinputCfg.reset();
 
     beginListener = Event::bus()->m_events.gesture.swipe.begin.listen(
         [](IPointer::SSwipeBeginEvent e, Event::SCallbackInfo& info) {
@@ -439,6 +481,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         if (stage == RENDER_POST_WALLPAPER) wallpapers.render();
     });
     tickListener = Event::bus()->m_events.tick.listen([] { wallpapers.damageAnimating(); });
+    reloadListener = Event::bus()->m_events.config.reloaded.listen([] { applyLibinputLogLevel(cfgQuietLibinput()); });
+    applyLibinputLogLevel(cfgQuietLibinput());
     wallpapers.init();
     return {"hyprmosaic", "Per-workspace wallpapers that slide with their workspace, plus grid workspace swipes", "La5u", "1.0"};
 }
@@ -449,15 +493,19 @@ APICALL EXPORT void PLUGIN_EXIT() {
     endListener.reset();
     renderListener.reset();
     tickListener.reset();
+    reloadListener.reset();
+    applyLibinputLogLevel(false);
     wallpapers.exit();
     swipe.releaseLater.reset();
     swipe.settling.clear();
-    swipe.held.reset();
+    swipe.shown.clear();
     swipe.start.reset();
     swipe.special.reset();
     blurFill.reset();
     wrapCfg.reset();
     specialSwipeCfg.reset();
+    freeSwipeCfg.reset();
+    quietLibinputCfg.reset();
     columnsCfg.reset();
     rowsCfg.reset();
     fingersCfg.reset();

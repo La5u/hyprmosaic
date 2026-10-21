@@ -76,6 +76,12 @@ hl.config({ plugin = { hyprmosaic = { columns = 4, rows = 2 } } })
 hl.config({ plugin = { hyprmosaic = { wrap = true } } })
 ```
 
+**Diagonal swipes.** Set `free_swipe = true` and swipes follow your fingers in any direction instead of locking to one axis: the workspaces beside, above or below, and diagonally across slide in together, and letting go lands on the one you moved far or fast enough towards, e.g. up and right from 5 goes to 3.
+
+```lua
+hl.config({ plugin = { hyprmosaic = { free_swipe = true } } })
+```
+
 **A single row.** Set `rows = 1` and swipe left and right through workspaces `1` to `columns`.
 
 **Your own setup.** Set `fingers = 0` to turn hyprmosaic's swipes off and keep only the wallpapers. Switch workspaces however you already do: keybinds, Hyprland's own `workspace` gesture, Waybar or anything else. Any workspace number can have a wallpaper.
@@ -93,6 +99,8 @@ hl.config({ plugin = { hyprmosaic = { fingers = 0 } } })
 | `fingers` | `3` | fingers for grid swipes, `0` to disable them |
 | `wrap` | `false` | swiping past a grid edge wraps to the opposite edge, e.g. left from 1 goes to 3 |
 | `special_swipe` | `false` | a grid swipe slides an open special workspace out with the workspace and closes it |
+| `free_swipe` | `false` | swipes move along both axes at once, reaching diagonal workspaces |
+| `quiet_libinput` | `false` | only log libinput errors; aquamarine otherwise logs a debug line for every touchpad event, even with `debug:disable_logs` |
 | `blur_fill` | `true` | fill around an image with a blurred copy of it, instead of `misc:background_color` |
 
 Set them in `hyprland.lua`, or as `plugin:hyprmosaic:<option>` in `hyprland.conf`:

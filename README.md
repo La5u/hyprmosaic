@@ -52,7 +52,7 @@ backend = none
 post_command = ln -sf $wallpaper ~/.local/state/hyprmosaic/$(hyprctl activeworkspace -j | jq .id)
 ```
 
-Waypaper won't start unless some wallpaper backend is installed, even with `backend = none`. Install a small one such as `swaybg`; it's never run.
+With `backend = none`, Waypaper runs `post_command` without invoking a wallpaper backend. No separate wallpaper backend needs to be installed.
 
 ## Workspace layouts
 

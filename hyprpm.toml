@@ -1,7 +1,9 @@
 [repository]
 name = "hyprmosaic"
 authors = ["La5u"]
-commit_pins = []
+commit_pins = [
+    ["efb50993780079460b0cbed1363e2166a2de1d9f", "6581bede9a3223fb8ad8433fbfc717022045ed27"], # Hyprland 0.56.2
+]
 
 [hyprmosaic]
 description = "3x3 workspace grid swipes with per-workspace wallpapers"

@@ -23,7 +23,7 @@
 #include <hyprland/src/config/values/types/BoolValue.hpp>
 #include <hyprland/src/config/values/types/IntValue.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/state/WorkspaceState.hpp>
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/render/Texture.hpp>
@@ -42,6 +42,13 @@ static HANDLE PHANDLE = nullptr;
 static Hyprutils::Signal::CHyprSignalListener beginListener, updateListener, endListener, renderListener, tickListener, reloadListener;
 static SP<Config::Values::CBoolValue> blurFill, wrapCfg, specialSwipeCfg, freeSwipeCfg, quietLibinputCfg;
 static SP<Config::Values::CIntValue> columnsCfg, rowsCfg, fingersCfg;
+
+// A workspace's number, or 0 for special workspaces.
+static int numberedID(const PHLWORKSPACE& ws) {
+    const auto id = ws->id();
+    const auto numbered = std::get_if<Workspace::SWorkspaceNumberedID>(&id);
+    return numbered ? (int)numbered->value : 0;
+}
 
 // Config values, with defaults in case registration failed.
 static bool cfgBlurFill() { return !blurFill || blurFill->value(); }
@@ -95,7 +102,7 @@ struct GridSwipe {
     bool valid(int id) const { return id >= 1 && id <= columns * rows; }
     // Workspace `x` columns and `y` rows from the start, or 0 past an edge unless wrapping.
     int cellID(int x, int y) const {
-        const int id = start->m_id - 1;
+        const int id = numberedID(start) - 1;
         int col = id % columns + x, row = id / columns + y;
         if (col < 0 || col >= columns) {
             if (!wrap) return 0;
@@ -108,11 +115,11 @@ struct GridSwipe {
         return row * columns + col + 1;
     }
     PHLWORKSPACE get(int id) const {
-        return valid(id) ? State::workspaceState()->query().id(id).run() : nullptr;
+        return valid(id) ? State::workspaceState()->query().numbered(Workspace::SWorkspaceNumberedID(id)).run() : nullptr;
     }
     PHLWORKSPACE ensure(int id) {
         if (auto ws = get(id)) return ws;
-        return State::workspaceState()->create(id, monitor->m_id);
+        return State::workspaceState()->createNumbered(Workspace::SWorkspaceNumberedID(id), monitor.lock());
     }
     // One cell's step on screen, per axis.
     Vector2D cellSize() const {
@@ -135,7 +142,7 @@ struct GridSwipe {
 
     // A target is reachable if it exists in the grid, isn't the start and doesn't live on another monitor.
     bool reachable(int id) const {
-        if (!valid(id) || id == start->m_id) return false;
+        if (!valid(id) || id == numberedID(start)) return false;
         const auto ws = get(id);
         return !ws || ws->m_monitor == monitor;
     }
@@ -172,7 +179,7 @@ struct GridSwipe {
         if (!active) {
             if (std::abs(total.x) < 5 && std::abs(total.y) < 5) return;
             vertical = std::abs(total.y) > std::abs(total.x);
-            active = valid(start->m_id);
+            active = valid(numberedID(start));
             if (!active) return;
         }
 
@@ -269,7 +276,7 @@ struct GridSwipe {
                 // Hidden now; put it back in place for the next time it opens.
                 special->m_renderOffset->setValueAndWarp({});
             }
-            monitor->changeWorkspace(targetID);
+            monitor->changeWorkspace(target);
             target->m_renderOffset->setValue(targetOffset);
             target->m_alpha->setValueAndWarp(1.F);
             start->m_renderOffset->setValue(startOffset);
@@ -390,18 +397,18 @@ struct GridWallpapers {
         cairo_surface_destroy(small);
     }
 
-    void render() {
+    void render(Render::CRenderContext& ctx) {
         swipe.releaseSettled();
         for (const int id : dirty) load(id);
         dirty.clear();
         if (walls.empty()) return;
 
-        const auto monitor = g_pHyprRenderer->m_renderData.pMonitor.lock();
+        const auto monitor = ctx.m_data.pMonitor.lock();
         if (!monitor) return;
         for (const auto& ref : State::workspaceState()->workspaceRefs()) {
             const auto ws = ref.lock();
             if (!ws || ws->m_monitor != monitor) continue;
-            const auto it = walls.find(ws->m_id);
+            const auto it = walls.find(numberedID(ws));
             if (it == walls.end()) continue;
             const auto& wall = it->second;
             if (ws != monitor->m_activeWorkspace && !ws->m_forceRendering && !ws->m_renderOffset->isBeingAnimated() && !ws->m_alpha->isBeingAnimated())
@@ -414,9 +421,9 @@ struct GridWallpapers {
             const float alpha = ws->m_alpha->value();
             CHyprColor color(*bgColor);
             color.a *= alpha;
-            g_pHyprRenderer->addPassElement(makeUnique<CRectPassElement>(CRectPassElement::SRectData{.box = {origin, size}, .color = color}));
-            if (cfgBlurFill()) drawImage(wall.blurred, origin, size, alpha * 0.6F, true);
-            drawImage(wall.image, origin, size, alpha, false);
+            Render::IHyprRenderer::addPassElement(ctx, makeUnique<CRectPassElement>(CRectPassElement::SRectData{.box = {origin, size}, .color = color}));
+            if (cfgBlurFill()) drawImage(ctx, wall.blurred, origin, size, alpha * 0.6F, true);
+            drawImage(ctx, wall.image, origin, size, alpha, false);
         }
     }
 
@@ -425,20 +432,20 @@ struct GridWallpapers {
     void damageAnimating() {
         for (const auto& ref : State::workspaceState()->workspaceRefs()) {
             const auto ws = ref.lock();
-            if (!ws || !walls.contains(ws->m_id) || (!ws->m_renderOffset->isBeingAnimated() && !ws->m_alpha->isBeingAnimated())) continue;
+            if (!ws || !walls.contains(numberedID(ws)) || (!ws->m_renderOffset->isBeingAnimated() && !ws->m_alpha->isBeingAnimated())) continue;
             if (const auto monitor = ws->m_monitor.lock()) g_pHyprRenderer->damageMonitor(monitor);
         }
     }
 
     // Scale tex to fit (or cover) the box at origin/size, centered and clipped to it.
-    static void drawImage(const SP<Render::ITexture>& tex, const Vector2D& origin, const Vector2D& size, float alpha, bool cover) {
+    static void drawImage(Render::CRenderContext& ctx, const SP<Render::ITexture>& tex, const Vector2D& origin, const Vector2D& size, float alpha, bool cover) {
         const double scale = cover ? std::max(size.x / tex->m_size.x, size.y / tex->m_size.y) : std::min(size.x / tex->m_size.x, size.y / tex->m_size.y);
         CTexPassElement::SRenderData data;
         data.tex = tex;
         data.box = {origin + (size - tex->m_size * scale) / 2.0, tex->m_size * scale};
         data.clipBox = {origin, size};
         data.a = alpha;
-        g_pHyprRenderer->addPassElement(makeUnique<CTexPassElement>(std::move(data)));
+        Render::IHyprRenderer::addPassElement(ctx, makeUnique<CTexPassElement>(std::move(data)));
     }
 } wallpapers;
 
@@ -477,8 +484,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         [](IPointer::SSwipeEndEvent e, Event::SCallbackInfo& info) {
             if (swipe.tracking) { info.cancelled = true; swipe.end(e.cancelled); }
         });
-    renderListener = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
-        if (stage == RENDER_POST_WALLPAPER) wallpapers.render();
+    renderListener = Event::bus()->m_events.render.stage.listen([](const Event::SRenderStageEvent& e) {
+        if (e.stage == RENDER_POST_WALLPAPER && e.context) wallpapers.render(e.context->get());
     });
     tickListener = Event::bus()->m_events.tick.listen([] { wallpapers.damageAnimating(); });
     reloadListener = Event::bus()->m_events.config.reloaded.listen([] { applyLibinputLogLevel(cfgQuietLibinput()); });
